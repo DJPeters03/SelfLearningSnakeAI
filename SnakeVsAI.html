@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Snake vs AI — Shared Spawn Array, Human Top & Self-Learning AI Bottom</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#0f1730; --grid:#18244a; --human:#7ee787; --ai:#61dafb;
+    --food:#ff7b72; --text:#e8eefc; --muted:#a9b5e6; --accent:#ffd166; --danger:#f43f5e;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial}
+  header{padding:10px 14px; background:linear-gradient(180deg, #0f1730, #0c1428); border-bottom:1px solid #131e3d}
+  h1{margin:0; font-size:18px}
+  small{color:var(--muted)}
+  #wrap{display:grid; grid-template-columns:1fr; gap:10px; padding:10px; max-width:1100px; margin:0 auto}
+  .board{background:var(--panel); border:1px solid #18244a; border-radius:12px; padding:10px}
+  .row{display:grid; grid-template-columns:1fr 200px; gap:10px; align-items:center}
+  canvas{width:100%; height:320px; background:#0a1328; border-radius:10px; display:block}
+  .hud{display:grid; gap:6px}
+  .hud .title{font-weight:600; letter-spacing:.3px}
+  .stat{display:flex; justify-content:space-between; font-variant-numeric:tabular-nums}
+  button, select, input[type=range]{width:100%; padding:8px 10px; border-radius:10px; border:1px solid #1a254b; background:#0d1835; color:var(--text)}
+  .bad{color:var(--danger)}
+  .good{color:var(--accent)}
+  .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:#0e1a38; border:1px solid #1b2a55; color:var(--muted); font-size:12px}
+  .legend{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .dot{width:10px; height:10px; border-radius:50%}
+  .dot.h{background:var(--human)}
+  .dot.a{background:var(--ai)}
+  .dot.f{background:var(--food)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Snake vs AI <small>— shared spawn order, human (top) vs self-learning AI (bottom)</small></h1>
+</header>
+
+<div id="wrap">
+  <div class="legend" style="padding:0 2px 6px 2px">
+    <span class="pill">Grid 20×20 • Tick ~100ms (adjustable)</span>
+    <span class="dot h"></span><small>Human snake</small>
+    <span class="dot a"></span><small>AI snake</small>
+    <span class="dot f"></span><small>Food (from pre-shuffled array)</small>
+  </div>
+
+  <!-- Human Board -->
+  <div class="board">
+    <div class="row">
+      <canvas id="canvasHuman" width="640" height="640" aria-label="Human snake board"></canvas>
+      <div class="hud">
+        <div class="title">Human (Top)</div>
+        <div class="stat"><span>Score</span><strong id="hScore">0</strong></div>
+        <div class="stat"><span>Length</span><strong id="hLen">1</strong></div>
+        <div class="stat"><span>Lives</span><strong id="hLives">∞</strong></div>
+        <div class="stat"><span>Food Index</span><strong id="hFoodIdx">0</strong></div>
+        <label>Tick Speed (ms)
+          <input id="speedHuman" type="range" min="50" max="250" step="10" value="100">
+        </label>
+        <button id="resetHuman">Reset Human</button>
+        <small>Controls: Arrow Keys or WASD. Don’t reverse into yourself.</small>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Board -->
+  <div class="board">
+    <div class="row">
+      <canvas id="canvasAI" width="640" height="640" aria-label="AI snake board"></canvas>
+      <div class="hud">
+        <div class="title">AI (Bottom) — Q-Learning</div>
+        <div class="stat"><span>Score</span><strong id="aScore">0</strong></div>
+        <div class="stat"><span>Length</span><strong id="aLen">1</strong></div>
+        <div class="stat"><span>Episodes</span><strong id="aEps">0</strong></div>
+        <div class="stat"><span>Food Index</span><strong id="aFoodIdx">0</strong></div>
+        <label>Epsilon (exploration)
+          <input id="epsilon" type="range" min="0" max="1" step="0.01" value="0.12">
+        </label>
+        <label>Tick Speed (ms)
+          <input id="speedAI" type="range" min="20" max="200" step="10" value="80">
+        </label>
+        <button id="resetAI">Reset AI (keeps Q-table)</button>
+        <button id="resetAll">Hard Reset (clears Q-table & spawn array)</button>
+        <small>Rewards: +1 eat, -1 death, -0.01/step. Actions: turn left / straight / right (relative).</small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================
+   Shared spawn array logic
+   ========================= */
+const GRID = 20;
+const CELL = 32; // drawing size; canvas CSS scales
+// Pre-shuffled array of all cells (x,y). Same for both boards.
+let spawnArray = null;
+
+function makeSpawnArray() {
+  const arr = [];
+  for (let y=0; y<GRID; y++){
+    for (let x=0; x<GRID; x++){
+      arr.push([x,y]);
+    }
+  }
+  // Fisher-Yates shuffle
+  for (let i=arr.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [arr[i],arr[j]] = [arr[j],arr[i]];
+  }
+  return arr;
+}
+
+/* =========================
+   Minimal snake engine
+   ========================= */
+function createGame({ctx, snakeColor, isAI=false, scoreEl, lenEl, idxEl, speedInput}) {
+  const state = {
+    ctx,
+    running: true,
+    tickMs: parseInt(speedInput.value,10),
+    snake: null, // array of {x,y}
+    dir: {x:1, y:0}, // right
+    pendingDir: null,
+    food: null,
+    score: 0,
+    foodIdx: 0,
+    episodes: 0, // for AI
+    isAI,
+  };
+
+  function resetSnake() {
+    const start = {x: Math.floor(GRID/2), y: Math.floor(GRID/2)};
+    state.snake = [start];
+    state.dir = {x:1, y:0};
+    state.pendingDir = null;
+  }
+
+  function placeFoodOnSequence(resetToFirst=false) {
+    if (!spawnArray) spawnArray = makeSpawnArray();
+    if (resetToFirst) state.foodIdx = 0;
+    // Try from state.foodIdx forward until we find a free cell
+    const taken = new Set(state.snake.map(p=>p.x+','+p.y));
+    for (let k=0; k<spawnArray.length; k++){
+      const idx = (state.foodIdx + k) % spawnArray.length;
+      const [fx,fy] = spawnArray[idx];
+      if (!taken.has(fx+','+fy)) {
+        state.food = {x:fx,y:fy};
+        state.foodIdx = idx; // current index where food sits
+        return;
+      }
+    }
+    // Fallback (shouldn't happen): random free
+    let fx=0,fy=0;
+    do { fx = (Math.random()*GRID)|0; fy = (Math.random()*GRID)|0; }
+    while (taken.has(fx+','+fy));
+    state.food = {x:fx,y:fy};
+  }
+
+  function advanceFoodIndex() {
+    if (!spawnArray) return;
+    let next = (state.foodIdx + 1) % spawnArray.length;
+    const taken = new Set(state.snake.map(p=>p.x+','+p.y));
+    for (let k=0;k<spawnArray.length;k++){
+      const idx = (next + k) % spawnArray.length;
+      const [fx,fy] = spawnArray[idx];
+      if (!taken.has(fx+','+fy)) {
+        state.food = {x:fx,y:fy};
+        state.foodIdx = idx;
+        return;
+      }
+    }
+  }
+
+  function draw() {
+    const c = state.ctx.canvas;
+    ctx.clearRect(0,0,c.width,c.height);
+    // grid
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid');
+    ctx.lineWidth = 1;
+    for (let i=0; i<=GRID; i++){
+      ctx.beginPath(); ctx.moveTo(i*CELL+.5,0); ctx.lineTo(i*CELL+.5,GRID*CELL); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0,i*CELL+.5); ctx.lineTo(GRID*CELL,i*CELL+.5); ctx.stroke();
+    }
+    // food
+    if (state.food){
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--food').trim();
+      ctx.fillRect(state.food.x*CELL+2, state.food.y*CELL+2, CELL-4, CELL-4);
+    }
+    // snake
+    ctx.fillStyle = snakeColor;
+    for (let i=0;i<state.snake.length;i++){
+      const p = state.snake[i];
+      ctx.fillRect(p.x*CELL+3, p.y*CELL+3, CELL-6, CELL-6);
+    }
+  }
+
+  function collideWall(p){ return p.x<0||p.y<0||p.x>=GRID||p.y>=GRID; }
+  function collideSelf(head,body){
+    for (let i=0;i<body.length;i++){
+      if (body[i].x===head.x && body[i].y===head.y) return true;
+    }
+    return false;
+  }
+
+  function stepHuman() {
+    // apply pendingDir if valid (no 180°)
+    if (state.pendingDir){
+      const nd = state.pendingDir, d = state.dir;
+      if (!(nd.x===-d.x && nd.y===-d.y)) state.dir = nd;
+      state.pendingDir = null;
+    }
+    moveAndResolve(null); // no AI action
+  }
+
+  /* =========================
+     Q-Learning for AI snake
+     ========================= */
+  // Q-table: key = stateStr, value = [Q_left, Q_straight, Q_right]
+  // Keep it outside instance so it persists between resets
+  if (!window.__QTABLE__) window.__QTABLE__ = {};
+  const Q = window.__QTABLE__;
+  let epsilon = parseFloat(document.getElementById('epsilon').value);
+  const alpha = 0.20;  // learning rate
+  const gamma = 0.92;  // discount
+  // Actions relative to current dir
+  const ACTIONS = [ -1, 0, 1 ]; // left, straight, right
+
+  function headingFromDir(d){
+    if (d.x===1 && d.y===0) return 0;     // right
+    if (d.x===0 && d.y===1) return 1;     // down
+    if (d.x===-1 && d.y===0) return 2;    // left
+    return 3;                              // up
+  }
+  function turn(dir, action){
+    // action: -1 left, 0 straight, 1 right
+    const h = headingFromDir(dir);
+    const nh = (h + action + 4) % 4;
+    if (nh===0) return {x:1, y:0};
+    if (nh===1) return {x:0, y:1};
+    if (nh===2) return {x:-1,y:0};
+    return {x:0,y:-1};
+  }
+
+  function senseDanger(dir){
+    // danger left/forward/right (1 or 0) if next cell would hit wall or self
+    const pts = [ -1, 0, 1 ].map(a => {
+      const nd = turn(dir,a);
+      const nx = state.snake[0].x + nd.x;
+      const ny = state.snake[0].y + nd.y;
+      const wouldHit = collideWall({x:nx,y:ny}) || state.snake.some((s,i)=> i>0 && s.x===nx && s.y===ny);
+      return wouldHit ? 1 : 0;
+    });
+    return pts; // [dangerLeft, dangerForward, dangerRight]
+  }
+
+  function foodBearing(dir){
+    // relative food direction: (-1,0,1) for x and y, rotated to snake frame
+    const dx = Math.sign(state.food.x - state.snake[0].x);
+    const dy = Math.sign(state.food.y - state.snake[0].y);
+    // rotate world deltas into snake-forward frame
+    const h = headingFromDir(dir);
+    // For h=0 (right): forward +x, left -y, right +y
+    let fx=dx, fy=dy;
+    if (h===1){ fx=dy; fy=-dx; }      // facing down rotate +90
+    else if (h===2){ fx=-dx; fy=-dy; } // facing left rotate 180
+    else if (h===3){ fx=-dy; fy=dx; }  // facing up rotate -90
+    // Reduce to signs
+    return [Math.sign(fx), Math.sign(fy)]; // [-1,0,1], [-1,0,1]
+  }
+
+  function encodeState(){
+    const [dl,df,dr] = senseDanger(state.dir);
+    const [fx,fy] = foodBearing(state.dir);
+    // also include head position coarse bins (4 bins each) to help
+    const hx = Math.floor(state.snake[0].x / 5);
+    const hy = Math.floor(state.snake[0].y / 5);
+    return `D${dl}${df}${dr}|F${fx}${fy}|H${hx}${hy}`;
+  }
+
+  function ensureQ(s){
+    if (!Q[s]) Q[s] = [0,0,0];
+    return Q[s];
+  }
+
+  function chooseAction(s){
+    // ε-greedy
+    if (Math.random() < epsilon) return (Math.random()*3)|0;
+    const q = ensureQ(s);
+    let best = 0, bv = q[0];
+    for (let i=1;i<3;i++){ if (q[i] > bv){ bv = q[i]; best = i; } }
+    return best;
+  }
+
+  function stepAI(){
+    epsilon = parseFloat(document.getElementById('epsilon').value);
+    const s = encodeState();
+    const aIdx = chooseAction(s);
+    const a = ACTIONS[aIdx];
+    const ndir = turn(state.dir, a);
+    moveAndResolve({s, aIdx, ndir});
+  }
+
+  function moveAndResolve(aiPack){
+    // movement
+    const dirToUse = aiPack ? aiPack.ndir : state.dir;
+    state.dir = dirToUse;
+    const head = state.snake[0];
+    const next = {x: head.x + state.dir.x, y: head.y + state.dir.y};
+
+    // check collisions
+    let reward = -0.01; // step cost
+    let died = false;
+    if (collideWall(next) || state.snake.some((s,i)=> i>0 && s.x===next.x && s.y===next.y)){
+      reward = -1;
+      died = true;
+    }
+
+    if (!died){
+      state.snake.unshift(next);
+      // eat?
+      if (state.food && next.x===state.food.x && next.y===state.food.y){
+        state.score++;
+        reward = +1;
+        advanceFoodIndex();
+      } else {
+        state.snake.pop();
+      }
+    }
+
+    // Q-update (if AI)
+    if (state.isAI && aiPack){
+      const s = aiPack.s;
+      const a = aiPack.aIdx;
+      const q = ensureQ(s);
+
+      if (died){
+        // terminal
+        q[a] = q[a] + alpha * (reward - q[a]);
+      } else {
+        const s2 = encodeState();
+        const q2 = ensureQ(s2);
+        const maxNext = Math.max(q2[0],q2[1],q2[2]);
+        q[a] = q[a] + alpha * (reward + gamma * maxNext - q[a]);
+      }
+    }
+
+    if (died){
+      // episode end
+      if (state.isAI) state.episodes++;
+      resetSnake();
+      placeFoodOnSequence(true); // reset to first element of the shuffled array
+      // maintain score? Traditional keeps cumulative score; we’ll keep it.
+    }
+
+    // draw + HUD
+    draw();
+    scoreEl.textContent = state.score;
+    lenEl.textContent = state.snake.length;
+    idxEl.textContent = state.foodIdx;
+  }
+
+  // init
+  resetSnake();
+  placeFoodOnSequence(true);
+  draw();
+
+  // tick loop
+  let handle = null;
+  function loop(){
+    if (!state.running) return;
+    handle = setTimeout(()=>{
+      if (state.isAI) stepAI(); else stepHuman();
+      state.tickMs = parseInt(speedInput.value,10);
+      loop();
+    }, state.tickMs);
+  }
+  loop();
+
+  // public controls
+  return {
+    state,
+    reset(hard=false){
+      if (hard){
+        // Clear shared Q and spawn
+        if (window.__QTABLE__) window.__QTABLE__ = {};
+        spawnArray = null;
+      }
+      state.score = 0;
+      state.foodIdx = 0;
+      state.episodes = 0;
+      resetSnake();
+      placeFoodOnSequence(true);
+      draw();
+    },
+    setDir(d){ state.pendingDir = d; },
+    stop(){ state.running = false; if (handle) clearTimeout(handle); },
+    start(){ if (!state.running){ state.running = true; loop(); } }
+  };
+}
+
+/* =========================
+   Wire up both boards
+   ========================= */
+const hCtx = document.getElementById('canvasHuman').getContext('2d');
+hCtx.canvas.width = GRID*CELL; hCtx.canvas.height = GRID*CELL;
+
+const aCtx = document.getElementById('canvasAI').getContext('2d');
+aCtx.canvas.width = GRID*CELL; aCtx.canvas.height = GRID*CELL;
+
+const gameHuman = createGame({
+  ctx: hCtx,
+  snakeColor: getComputedStyle(document.documentElement).getPropertyValue('--human').trim(),
+  isAI: false,
+  scoreEl: document.getElementById('hScore'),
+  lenEl: document.getElementById('hLen'),
+  idxEl: document.getElementById('hFoodIdx'),
+  speedInput: document.getElementById('speedHuman'),
+});
+const gameAI = createGame({
+  ctx: aCtx,
+  snakeColor: getComputedStyle(document.documentElement).getPropertyValue('--ai').trim(),
+  isAI: true,
+  scoreEl: document.getElementById('aScore'),
+  lenEl: document.getElementById('aLen'),
+  idxEl: document.getElementById('aFoodIdx'),
+  speedInput: document.getElementById('speedAI'),
+});
+
+// Keyboard controls for human
+addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  if (k==='arrowup' || k==='w') gameHuman.setDir({x:0,y:-1});
+  else if (k==='arrowdown' || k==='s') gameHuman.setDir({x:0,y:1});
+  else if (k==='arrowleft' || k==='a') gameHuman.setDir({x:-1,y:0});
+  else if (k==='arrowright' || k==='d') gameHuman.setDir({x:1,y:0});
+});
+
+// Buttons
+document.getElementById('resetHuman').onclick = ()=> gameHuman.reset(false);
+document.getElementById('resetAI').onclick = ()=> gameAI.reset(false);
+document.getElementById('resetAll').onclick = ()=>{
+  gameHuman.reset(true);
+  gameAI.reset(true);
+};
+
+// Keep AI episodes visible
+const epEl = document.getElementById('aEps');
+setInterval(()=>{ epEl.textContent = gameAI.state.episodes; }, 200);
+
+/* Responsive canvas height hint (CSS scales width) */
+function fitHeights(){
+  const ch = Math.min(420, Math.floor(window.innerHeight * 0.35));
+  document.getElementById('canvasHuman').style.height = ch+'px';
+  document.getElementById('canvasAI').style.height = ch+'px';
+}
+addEventListener('resize', fitHeights); fitHeights();
+</script>
+</body>
+</html>
